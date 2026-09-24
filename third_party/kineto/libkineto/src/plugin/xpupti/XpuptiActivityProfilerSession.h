@@ -42,7 +42,6 @@ using DeviceUUIDsT = std::array<unsigned char, 16>;
 // inside the session so the plugin tests build the same records it consumes.
 #if PTI_VERSION_AT_LEAST(0, 18)
 inline constexpr bool kReportsEngineIds = true;
-using pti_view_record_kernel_t = pti_view_record_kernel_v2;
 using pti_view_record_memcpy_t = pti_view_record_memory_copy_v2;
 #if PTI_VERSION_AT_LEAST(1, 3)
 // The peer-to-peer copy record names the device that ran the copy.
@@ -56,10 +55,22 @@ using pti_view_record_memfill_t = pti_view_record_memory_fill_v2;
 #else
 inline constexpr bool kReportsEngineIds = false;
 inline constexpr bool kReportsCopyExecutingDevice = false;
-using pti_view_record_kernel_t = pti_view_record_kernel;
 using pti_view_record_memcpy_t = pti_view_record_memory_copy;
 using pti_view_record_memcpy_p2p_t = pti_view_record_memory_copy_p2p;
 using pti_view_record_memfill_t = pti_view_record_memory_fill;
+#endif
+
+// The v3 kernel record (PTI 1.3+) extends v2 with the work-group count and size
+// a kernel was launched with.
+#if PTI_VERSION_AT_LEAST(1, 3)
+inline constexpr bool kReportsLaunchGeometry = true;
+using pti_view_record_kernel_t = pti_view_record_kernel_v3;
+#elif PTI_VERSION_AT_LEAST(0, 18)
+inline constexpr bool kReportsLaunchGeometry = false;
+using pti_view_record_kernel_t = pti_view_record_kernel_v2;
+#else
+inline constexpr bool kReportsLaunchGeometry = false;
+using pti_view_record_kernel_t = pti_view_record_kernel;
 #endif
 
 class XpuptiActivityProfilerSession

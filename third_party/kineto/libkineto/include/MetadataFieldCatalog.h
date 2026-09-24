@@ -181,6 +181,9 @@ inline constexpr MetadataField<int64_t> kStream{"stream"};
 } // namespace libkineto::RocmMetadataFields
 
 namespace libkineto::XpuMetadataFields {
+// A work-group holds the work-items a CUDA block holds threads, so the launch
+// geometry is reported under the keys trace consumers already know.
+inline constexpr MetadataField<std::vector<int64_t>> kBlock{"block"};
 inline constexpr MetadataField<uint64_t> kBytes{"bytes"};
 inline constexpr MetadataField<uint64_t> kCommunicatorId{"Communicator_id"};
 inline constexpr MetadataField<uint64_t> kCorrelation{"correlation"};
@@ -188,6 +191,7 @@ inline constexpr MetadataField<int64_t> kDevice{"device"};
 inline constexpr MetadataField<uint64_t> kEngineIndex{"engine_index"};
 inline constexpr MetadataField<uint64_t> kEngineOrdinal{"engine_ordinal"};
 inline constexpr MetadataField<int64_t> kFromDevice{"fromDevice"};
+inline constexpr MetadataField<std::vector<int64_t>> kGrid{"grid"};
 inline constexpr MetadataField<int64_t> kInDevice{"inDevice"};
 inline constexpr MetadataField<uint64_t> kKernelId{"kernel_id"};
 inline constexpr MetadataField<double> kMemoryBandwidthGbps{

@@ -372,6 +372,96 @@ TEST_F(XpuptiActivityHandlersTest, MemoryCopyActivityExposesEngineIds) {
 
 #endif // PTI_VERSION_AT_LEAST(0, 18)
 
+// --- Launch geometry metadata tests ---
+
+// Records carry the work-group count and size only from PTI 1.3 on.
+#if PTI_VERSION_AT_LEAST(1, 3)
+
+TEST_F(XpuptiActivityHandlersTest, KernelActivityExposesLaunchGeometry) {
+  KN::pti_view_record_kernel_t kernel_record{};
+  kernel_record._view_kind._view_kind = PTI_VIEW_DEVICE_GPU_KERNEL;
+  kernel_record._name = "test_kernel";
+  kernel_record._start_timestamp = 100;
+  kernel_record._end_timestamp = 200;
+  kernel_record._thread_id = 7;
+  kernel_record._correlation_id = 21;
+  kernel_record._sycl_queue_id = 64;
+  kernel_record._kernel_id = 1;
+  kernel_record._group_count[0] = 4;
+  kernel_record._group_count[1] = 106;
+  kernel_record._group_count[2] = 1;
+  kernel_record._group_size[0] = 128;
+  kernel_record._group_size[1] = 1;
+  kernel_record._group_size[2] = 1;
+
+  mockApi_.records.push_back(&kernel_record._view_kind);
+
+  auto traceBuffer = processAndGetTrace();
+  ASSERT_EQ(traceBuffer->activities.size(), 1);
+
+  auto& activity = *traceBuffer->activities[0];
+  const std::optional<std::vector<int64_t>> expected_grid{{4, 106, 1}};
+  const std::optional<std::vector<int64_t>> expected_block{{128, 1, 1}};
+  EXPECT_EQ(activity.type(), ActivityType::CONCURRENT_KERNEL);
+  EXPECT_EQ(activity.getMetadataValue(XpuMetadataFields::kGrid), expected_grid);
+  EXPECT_EQ(
+      activity.getMetadataValue(XpuMetadataFields::kBlock), expected_block);
+}
+
+TEST_F(XpuptiActivityHandlersTest, LaunchGeometryKeysStayOnZeroGeometry) {
+  // A launch API that does not carry the geometry leaves it zeroed; the keys
+  // stay so that a consumer sees the same key set on every kernel.
+  KN::pti_view_record_kernel_t kernel_record{};
+  kernel_record._view_kind._view_kind = PTI_VIEW_DEVICE_GPU_KERNEL;
+  kernel_record._name = "test_kernel";
+  kernel_record._start_timestamp = 100;
+  kernel_record._end_timestamp = 200;
+  kernel_record._thread_id = 7;
+  kernel_record._correlation_id = 21;
+  kernel_record._sycl_queue_id = 64;
+  kernel_record._kernel_id = 1;
+
+  mockApi_.records.push_back(&kernel_record._view_kind);
+
+  auto traceBuffer = processAndGetTrace();
+  ASSERT_EQ(traceBuffer->activities.size(), 1);
+
+  auto& activity = *traceBuffer->activities[0];
+  const std::optional<std::vector<int64_t>> expected_zeros{{0, 0, 0}};
+  EXPECT_EQ(
+      activity.getMetadataValue(XpuMetadataFields::kGrid), expected_zeros);
+  EXPECT_EQ(
+      activity.getMetadataValue(XpuMetadataFields::kBlock), expected_zeros);
+}
+
+TEST_F(XpuptiActivityHandlersTest, MemoryCopyActivityOmitsLaunchGeometry) {
+  KN::pti_view_record_memcpy_t memory_record{};
+  memory_record._view_kind._view_kind = PTI_VIEW_DEVICE_GPU_MEM_COPY;
+  memory_record._name = "zeCommandListAppendMemoryCopy(M2D)";
+  memory_record._start_timestamp = 100;
+  memory_record._end_timestamp = 200;
+  memory_record._thread_id = 7;
+  memory_record._correlation_id = 22;
+  memory_record._sycl_queue_id = 64;
+  memory_record._mem_op_id = 1;
+  memory_record._bytes = 1024;
+
+  mockApi_.records.push_back(&memory_record._view_kind);
+
+  auto traceBuffer = processAndGetTrace();
+  ASSERT_EQ(traceBuffer->activities.size(), 1);
+
+  auto& activity = *traceBuffer->activities[0];
+  EXPECT_EQ(
+      activity.metadataJson().find(XpuMetadataFields::kGrid.name),
+      std::string::npos);
+  EXPECT_EQ(
+      activity.metadataJson().find(XpuMetadataFields::kBlock.name),
+      std::string::npos);
+}
+
+#endif // PTI_VERSION_AT_LEAST(1, 3)
+
 TEST_F(XpuptiActivityHandlersTest, SwimLanesStayPerSyclQueueNotPerEngine) {
   // A kernel on a compute engine and a copy on a copy engine, both submitted to
   // the SAME SYCL queue, must share one swim lane named after that queue.

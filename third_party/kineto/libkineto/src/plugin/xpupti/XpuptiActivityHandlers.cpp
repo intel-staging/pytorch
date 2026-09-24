@@ -353,6 +353,22 @@ void XpuptiActivityProfilerSession::handleRuntimeKernelMemcpyMemsetActivities(
     trace_activity->addMetadata(
         XpuFields::kSyclInvocationId,
         static_cast<uint64_t>(activity->_sycl_invocation_id));
+    if constexpr (kReportsLaunchGeometry) {
+      // The number of work-groups maps onto CUDA's grid, the size of one onto
+      // its block. Both are zero when the launch API did not carry them.
+      trace_activity->addMetadata(
+          XpuFields::kGrid,
+          std::vector<int64_t>{
+              static_cast<int64_t>(activity->_group_count[0]),
+              static_cast<int64_t>(activity->_group_count[1]),
+              static_cast<int64_t>(activity->_group_count[2])});
+      trace_activity->addMetadata(
+          XpuFields::kBlock,
+          std::vector<int64_t>{
+              static_cast<int64_t>(activity->_group_size[0]),
+              static_cast<int64_t>(activity->_group_size[1]),
+              static_cast<int64_t>(activity->_group_size[2])});
+    }
   } else if constexpr (handleMemcpyActivities || handleMemsetActivities) {
     trace_activity->addMetadata(
         XpuFields::kMemoryOperationId,

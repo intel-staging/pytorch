@@ -14,6 +14,7 @@
 #include "src/plugin/xpupti/XpuptiActivityProfiler.h"
 #include "src/plugin/xpupti/XpuptiActivityProfilerSession.h"
 #include "test/xpupti/compute/XpuptiPeerCopyCompute.h"
+#include "src/plugin/xpupti/XpuptiProfilerMacros.h"
 
 #include <fmt/ranges.h>
 #include <gtest/gtest.h>
@@ -239,6 +240,71 @@ TEST(XpuptiProfilerTest, OverheadActivity) {
         << "metadata = " << metadata;
   }
 }
+
+// The work-group count and size reach the kernel record only from PTI 1.3 on.
+#if PTI_VERSION_AT_LEAST(1, 3)
+TEST(XpuptiProfilerTest, KernelActivityCarriesLaunchGeometry) {
+  KN::Config cfg;
+
+  std::vector<std::string_view> metrics;
+
+  std::set<KN::ActivityType> activities{KN::ActivityType::CONCURRENT_KERNEL};
+
+  std::vector<std::string_view> expectedActivities = {
+      "Run(sycl::_V1::queue, ...)"};
+  std::vector<std::string_view> expectedTypes = {"kernel"};
+
+  constexpr unsigned repeatCount = 1;
+  auto [pSession, pBuffer] = RunProfilerTest(
+      metrics,
+      activities,
+      cfg,
+      repeatCount,
+      std::move(expectedActivities),
+      std::move(expectedTypes));
+
+  // The workload launches a plain sycl::range, so the runtime picks the
+  // work-group size; what can be asserted is that the work-groups cover the
+  // global range the kernel was submitted with.
+  constexpr int64_t kGlobalWorkItems = 16 * 16;
+
+  unsigned kernelCount = 0;
+  for (auto&& pActivity : pBuffer->activities) {
+    if (pActivity->type() != KN::ActivityType::CONCURRENT_KERNEL) {
+      continue;
+    }
+    ++kernelCount;
+
+    const auto metadata =
+        nlohmann::json::parse("{" + pActivity->metadataJson() + "}");
+    ASSERT_TRUE(metadata.contains(
+        std::string{libkineto::XpuMetadataFields::kGrid.name}))
+        << "metadata = " << metadata.dump();
+    ASSERT_TRUE(metadata.contains(
+        std::string{libkineto::XpuMetadataFields::kBlock.name}))
+        << "metadata = " << metadata.dump();
+
+    const auto grid =
+        metadata[std::string{libkineto::XpuMetadataFields::kGrid.name}]
+            .get<std::vector<int64_t>>();
+    const auto block =
+        metadata[std::string{libkineto::XpuMetadataFields::kBlock.name}]
+            .get<std::vector<int64_t>>();
+    ASSERT_EQ(grid.size(), 3);
+    ASSERT_EQ(block.size(), 3);
+
+    int64_t workItems = 1;
+    for (std::size_t dim = 0; dim < 3; ++dim) {
+      EXPECT_GT(grid[dim], 0) << "grid dimension " << dim;
+      EXPECT_GT(block[dim], 0) << "block dimension " << dim;
+      workItems *= grid[dim] * block[dim];
+    }
+    EXPECT_EQ(workItems, kGlobalWorkItems);
+  }
+
+  EXPECT_GT(kernelCount, 0u) << "no kernel activity to check";
+}
+#endif // PTI_VERSION_AT_LEAST(1, 3)
 
 TEST(XpuptiProfilerTest, TestEvents) {
   KN::Config cfg;
