@@ -10,6 +10,7 @@
 
 #include "src/ActivityBuffers.h"
 #include "src/plugin/xpupti/XpuptiActivityProfiler.h"
+#include "src/plugin/xpupti/XpuptiProfilerMacros.h"
 #include "test/xpupti/compute/XpuptiScopeProfilerCompute.h"
 
 #include <libkineto.h>
@@ -18,6 +19,9 @@
 #include <fmt/ranges.h>
 
 #include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
 
 namespace KN = KINETO_NAMESPACE;
 
@@ -202,6 +206,48 @@ static unsigned acceptOverheadActivities(
   return count;
 }
 
+// The SYCL language layer spans (submit, queue.wait) are runtime records like
+// the Unified Runtime calls they wrap, but how many of them a workload produces
+// depends on how often the runtime waits, so accept whatever is reported rather
+// than pin a count down. The guard is on the headers, while what the loaded PTI
+// reports is a runtime matter, so the count is not asserted here; the spans
+// have their own test on the PTI side.
+// TODO: confirm the PTI version that starts reporting these spans - the change
+// is not in a PTI release yet - and fix the guard below.
+#if PTI_VERSION_AT_LEAST(1, 3)
+inline constexpr bool kReportsSyclLanguageSpans = true;
+#else
+inline constexpr bool kReportsSyclLanguageSpans = false;
+#endif
+
+constexpr const std::string_view runtimeActivity = "xpu_runtime";
+constexpr std::array<std::string_view, 2> kSyclLanguageSpanNames{
+    "submit",
+    "queue.wait"};
+
+static void acceptSyclLanguageSpans(
+    const std::deque<std::unique_ptr<libkineto::GenericTraceActivity>>&
+        pBufferActivities,
+    std::vector<std::string_view>& expectedActivities,
+    std::vector<std::string_view>& expectedTypes,
+    std::set<std::string>& stringStorage) {
+  for (auto&& pActivity : pBufferActivities) {
+    if (pActivity->type() != KN::ActivityType::XPU_RUNTIME) {
+      continue;
+    }
+    const auto isSpan = std::find(
+                            kSyclLanguageSpanNames.begin(),
+                            kSyclLanguageSpanNames.end(),
+                            pActivity->name()) != kSyclLanguageSpanNames.end();
+    if (not isSpan) {
+      continue;
+    }
+    auto insertResult = stringStorage.insert(pActivity->name());
+    expectedActivities.push_back(*insertResult.first);
+    expectedTypes.push_back(runtimeActivity);
+  }
+}
+
 std::pair<
     std::unique_ptr<KN::IActivityProfilerSession>,
     std::unique_ptr<KN::CpuTraceBuffer>>
@@ -272,6 +318,15 @@ RunProfilerTest(
     auto count = acceptOverheadActivities(
         pBuffer->activities, expectedActivities, expectedTypes, stringStorage);
     EXPECT_GT(count, 0);
+  }
+  if constexpr (kReportsSyclLanguageSpans) {
+    if (activities.find(KN::ActivityType::XPU_RUNTIME) != activities.end()) {
+      acceptSyclLanguageSpans(
+          pBuffer->activities,
+          expectedActivities,
+          expectedTypes,
+          stringStorage);
+    }
   }
 
   static bool isVerbose = IsEnvVerbose();
