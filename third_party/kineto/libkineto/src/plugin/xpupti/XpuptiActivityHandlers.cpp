@@ -176,6 +176,21 @@ static void addTimestampMetadata(
       label, formatTimeLikeOutputJson(signedFromUnsignedDiff(time, time_ref)));
 }
 
+namespace {
+// The SYCL language layer spans are host work with no device activity behind
+// their own correlation ids, so they must not open a host to device link: what
+// the device work answers is the Unified Runtime call nested in the submit.
+bool isSyclLanguageSpan([[maybe_unused]] const pti_view_record_api* activity) {
+#if PTI_VERSION_AT_LEAST(1, 3)
+  return activity->_api_group == PTI_API_GROUP_SYCL &&
+      (activity->_api_id == PTI_API_ID_SYCL_SUBMIT ||
+       activity->_api_id == PTI_API_ID_SYCL_QUEUE_WAIT);
+#else
+  return false;
+#endif
+}
+} // namespace
+
 auto XpuptiActivityProfilerSession::ac2gFlowRole(
     ActivityType activityType) const -> Ac2gFlowRole {
   switch (activityType) {
@@ -239,7 +254,12 @@ void XpuptiActivityProfilerSession::handleRuntimeKernelMemcpyMemsetActivities(
   trace_activity->startTime = activity->_start_timestamp;
   trace_activity->endTime = activity->_end_timestamp;
   trace_activity->threadId = activity->_thread_id;
-  const auto role = ac2gFlowRole(activityType);
+  auto role = ac2gFlowRole(activityType);
+  if constexpr (handleRuntimeActivities) {
+    if (isSyclLanguageSpan(activity)) {
+      role = Ac2gFlowRole::None;
+    }
+  }
   if (role != Ac2gFlowRole::None) {
     trace_activity->flow.id = activity->_correlation_id;
     trace_activity->flow.type = libkineto::kLinkAsyncCpuGpu;
