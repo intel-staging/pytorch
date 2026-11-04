@@ -2,7 +2,9 @@
 #include <torch/csrc/profiler/kineto_shim.h>
 
 #include <algorithm>
+#include <string_view>
 #include <type_traits>
+#include <unordered_set>
 
 #ifdef USE_KINETO
 #include <libkineto.h>
@@ -13,6 +15,7 @@
 #include <ATen/detail/MTIAHooksInterface.h>
 #include <c10/core/DeviceType.h>
 #include <c10/util/Exception.h>
+#include <c10/util/StringUtil.h>
 #include <c10/util/env.h>
 
 namespace torch {
@@ -92,7 +95,8 @@ const ActivityTypeMap kPrivateUse1Types{
 // return the matching subset of activity types.
 std::unordered_set<libkineto::ActivityType> filterActivities(
     const ActivityTypeMap& defaults,
-    const std::unordered_set<std::string>& requested) {
+    const std::unordered_set<std::string>& requested,
+    std::string_view hint = {}) {
   std::unordered_set<libkineto::ActivityType> result;
   for (const auto& name : requested) {
     bool found = false;
@@ -104,7 +108,7 @@ std::unordered_set<libkineto::ActivityType> filterActivities(
       }
     }
     TORCH_CHECK(
-        found, "Unknown or non-member activity type name: '", name, "'");
+        found, "Unknown or non-member activity type name: '", name, "'", hint);
   }
   return result;
 }
@@ -117,10 +121,10 @@ struct XpuActivityRequest {
 };
 
 // For the XPU group, a requested name that matches an activity type acts as a
-// fine-grained activity filter (see #176351); any other name is treated as an
-// XPU hardware metric name handled by the XPUPTI scope profiler. We cannot
-// validate metric names here: they are device-specific and only known to
-// PTI/driver, so unknown names are forwarded rather than rejected.
+// fine-grained activity filter (see #176351). A name that matches none is the
+// deprecated way of requesting an XPU hardware metric; such a name cannot be
+// validated here - metrics are device-specific and known only to PTI/the
+// driver - so it is forwarded rather than rejected.
 XpuActivityRequest splitXpuRequest(
     const ActivityTypeMap& defaults,
     const std::unordered_set<std::string>& requested) {
@@ -137,6 +141,22 @@ XpuActivityRequest splitXpuRequest(
     }
   }
   return out;
+}
+
+// Config keys of KernelMetricsConfig, which this shim consumes, and of
+// PerformanceMetricsConfig, whose time-based sampling XPU does not implement.
+constexpr const char* kKernelMetricsKey = "KERNEL_METRICS";
+constexpr const char* kPerformanceMetricsKey = "PERFORMANCE_METRICS";
+
+// Comma-separated metric names, as KernelMetricsConfig serializes them.
+std::vector<std::string> splitMetricNames(const std::string& value) {
+  std::vector<std::string> names;
+  for (const auto name : c10::split(value, ',')) {
+    if (!name.empty()) {
+      names.emplace_back(name);
+    }
+  }
+  return names;
 }
 
 // Build the Kineto config fragment that drives the XPUPTI scope profiler.
@@ -157,6 +177,84 @@ std::string buildXpuScopeConfig(const std::vector<std::string>& metrics) {
   }
   configss << "\nXPUPTI_PROFILER_ENABLE_PER_KERNEL=true\n";
   return std::move(configss).str();
+}
+
+// Resolve what the XPU group asked for: which activity types to collect, and
+// which hardware metrics the XPUPTI scope profiler should measure. Returns the
+// Kineto config fragment driving that profiler, empty without metrics.
+std::string configureXpuActivities(
+    const ActivityFilter& activity_filter,
+    const ProfilerExtensionMap& profiler_extensions,
+    std::set<libkineto::ActivityType>& k_activities) {
+  // Hardware metrics requested through KernelMetricsConfig, which keeps them
+  // apart from the activity types and preserves their order.
+  const auto extensions_it =
+      profiler_extensions.find(torch::autograd::profiler::ActivityType::XPU);
+  std::vector<std::string> metrics;
+  bool has_metrics_config = false;
+  if (extensions_it != profiler_extensions.end()) {
+    const auto& extensions = extensions_it->second;
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        !extensions.contains(kPerformanceMetricsKey),
+        "PerformanceMetricsConfig (time-based sampling) is not supported for "
+        "ProfilerActivity.XPU yet; use KernelMetricsConfig for per-kernel "
+        "hardware metrics");
+    const auto metrics_it = extensions.find(kKernelMetricsKey);
+    if (metrics_it != extensions.end()) {
+      metrics = splitMetricNames(metrics_it->second);
+      TORCH_CHECK_VALUE(
+          !metrics.empty(),
+          "KernelMetricsConfig for ProfilerActivity.XPU lists no metric name");
+      has_metrics_config = true;
+    }
+  }
+  const auto filter_it =
+      activity_filter.find(torch::autograd::profiler::ActivityType::XPU);
+  if (filter_it == activity_filter.end()) {
+    for (const auto& entry : kXpuTypes) {
+      k_activities.insert(entry.first);
+    }
+  } else if (has_metrics_config) {
+    // The metrics have a field of their own, so every name must be an
+    // activity type.
+    const auto types = filterActivities(
+        kXpuTypes,
+        filter_it->second,
+        "; hardware metric names belong in KernelMetricsConfig.metric_names");
+    k_activities.insert(types.begin(), types.end());
+  } else {
+    const auto request = splitXpuRequest(kXpuTypes, filter_it->second);
+    k_activities.insert(
+        request.activity_types.begin(), request.activity_types.end());
+    if (!request.metrics.empty()) {
+      // TORCH_WARN_ONCE, since a DeprecationWarning is hidden unless raised
+      // from __main__. A dict request collects exactly what it lists (see
+      // #176351), so a list of only metric names also drops the defaults.
+      TORCH_WARN_ONCE(
+          "Requesting XPU hardware metrics by name in the activity type list "
+          "is deprecated and will be removed in a future release. These names "
+          "were taken as metric names: ",
+          c10::Join(", ", request.metrics),
+          ". Pass them as ProfilerActivityConfig(activity_types=<the activity "
+          "type names, or None for the defaults>, profiler_configs=["
+          "KernelMetricsConfig(metric_names=[...])]) instead.",
+          request.activity_types.empty()
+              ? " This request also drops the default XPU activities, which "
+                "KernelMetricsConfig keeps."
+              : "");
+      metrics = request.metrics;
+    }
+  }
+  if (metrics.empty()) {
+    return {};
+  }
+  k_activities.insert(libkineto::ActivityType::XPU_SCOPE_PROFILER);
+  // The scope profiler attaches metrics to individual kernels and needs the
+  // kernel activity view to correlate them to real kernel timestamps; without
+  // it the metrics would land on synthetic timestamps. Enabling metrics
+  // therefore implies collecting kernels.
+  k_activities.insert(libkineto::ActivityType::CONCURRENT_KERNEL);
+  return buildXpuScopeConfig(metrics);
 }
 
 } // namespace
@@ -378,37 +476,8 @@ void prepareTrace(
     insertActivities(torch::autograd::profiler::ActivityType::CPU, kCpuTypes);
   }
   if (activities.contains(torch::autograd::profiler::ActivityType::XPU)) {
-    const auto filter_it =
-        activity_filter.find(torch::autograd::profiler::ActivityType::XPU);
-    if (filter_it != activity_filter.end()) {
-      // A filtered XPU request may mix activity type names (fine-grained
-      // filtering) with XPU hardware metric names (scope profiler).
-      const auto request = splitXpuRequest(kXpuTypes, filter_it->second);
-      k_activities.insert(
-          request.activity_types.begin(), request.activity_types.end());
-      if (!request.metrics.empty()) {
-        k_activities.insert(libkineto::ActivityType::XPU_SCOPE_PROFILER);
-        // The scope profiler attaches metrics to individual kernels and needs
-        // the kernel activity view to correlate them to real kernel
-        // timestamps; without it the metrics would land on synthetic
-        // timestamps. Enabling metrics therefore implies collecting kernels.
-        k_activities.insert(libkineto::ActivityType::CONCURRENT_KERNEL);
-        extraConfig = buildXpuScopeConfig(request.metrics);
-        // A dict request collects exactly what it lists (see #176351), so
-        // asking only for metrics drops the default XPU activities (memcpy,
-        // runtime, driver, overhead). Warn since this is rarely intended.
-        if (request.activity_types.empty()) {
-          TORCH_WARN(
-              "Only XPU hardware metrics were requested for ProfilerActivity.XPU; "
-              "default XPU activities (e.g. XPU_RUNTIME, GPU_MEMCPY) will not be "
-              "traced. List the desired activity type names alongside the metrics "
-              "to collect them as well.");
-        }
-      }
-    } else {
-      // Trace default XPU activity types
-      insertActivities(torch::autograd::profiler::ActivityType::XPU, kXpuTypes);
-    }
+    extraConfig = configureXpuActivities(
+        activity_filter, profiler_extensions, k_activities);
   }
   if (has_mtia_activity) {
     TORCH_CHECK(
@@ -470,11 +539,36 @@ void prepareTrace(
   }
 
   const std::string traceIdStr = setTraceID(trace_id);
-  for (const auto& [name, value] : profiler_extensions) {
-    extraConfig += name;
-    extraConfig += '=';
-    extraConfig += value;
-    extraConfig += '\n';
+  // Kineto takes one flat configuration, so the configs of the traced groups
+  // must not set the same key; a group that is not traced passes on nothing.
+  std::unordered_set<std::string> forwarded_keys;
+  for (const auto& [activity, extensions] : profiler_extensions) {
+    for (const auto& [name, value] : extensions) {
+      if (name == kKernelMetricsKey) {
+        // Consumed by configureXpuActivities; Kineto does not know the key.
+        TORCH_CHECK_NOT_IMPLEMENTED(
+            activity == torch::autograd::profiler::ActivityType::XPU,
+            "KernelMetricsConfig is only supported for ProfilerActivity.XPU");
+        if (!activities.contains(activity)) {
+          TORCH_WARN(
+              "KernelMetricsConfig is ignored because ProfilerActivity.XPU is "
+              "not traced");
+        }
+        continue;
+      }
+      if (!activities.contains(activity)) {
+        continue;
+      }
+      TORCH_CHECK_VALUE(
+          forwarded_keys.insert(name).second,
+          "More than one activity group sets the profiler config entry ",
+          name,
+          "; attach the config to one group only");
+      extraConfig += name;
+      extraConfig += '=';
+      extraConfig += value;
+      extraConfig += '\n';
+    }
   }
   // Registration fixes only whether libkineto can trace a GPU; this key says
   // whether this trace may trace any device. A trace that requested no device

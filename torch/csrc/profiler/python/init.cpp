@@ -392,23 +392,16 @@ void initPythonBindings(PyObject* module) {
       .value(
           "XPU",
           ActivityType::XPU,
-          "Intel XPU device activity. In a fine-grained activity dict "
-          "(``{ProfilerActivity.XPU: [...]}``), names that are not XPU "
-          "activity types are interpreted as Intel XPU hardware metric names "
-          "and enable the per-kernel scope profiler, e.g. "
-          "``{ProfilerActivity.XPU: [\"GpuTime\", \"GpuCoreClocks\"]}``. The "
-          "metric values are attached to each kernel as Perfetto counters. "
-          "Hardware metric collection requires ``ZET_ENABLE_METRICS=1`` and "
-          "access to the GPU performance counters "
-          "(``perf_stream_paranoid``/``observation_paranoid`` set to ``0``). "
-          "Metric names are device-specific and defined by the driver, not by "
-          "PyTorch. Because a dict entry collects exactly what it lists, "
-          "requesting only metrics (e.g. "
-          "``{ProfilerActivity.XPU: [\"GpuTime\"]}``) does not also collect "
-          "the default XPU activities; list the desired activity type names "
-          "alongside the metrics to keep tracing them, e.g. "
-          "``{ProfilerActivity.XPU: [\"CONCURRENT_KERNEL\", \"XPU_RUNTIME\", "
-          "\"GpuTime\"]}``.")
+          "Intel XPU device activity. To measure XPU hardware metrics per "
+          "kernel, use ``ProfilerActivityConfig`` with a "
+          "``KernelMetricsConfig`` in the activity dict, e.g. "
+          "``{ProfilerActivity.XPU: ProfilerActivityConfig("
+          "profiler_configs=[KernelMetricsConfig("
+          "metric_names=[\"GpuTime\", \"GpuCoreClocks\"])])}``. "
+          "Metric names are XPUPTI scope profiler metrics supported by the "
+          "current XPU device. Naming metrics among the activity types "
+          "instead, e.g. ``{ProfilerActivity.XPU: [\"GpuTime\"]}``, is "
+          "deprecated.")
       .value("MTIA", ActivityType::MTIA, "MTIA device activity.")
       .value(
           "CUDA",

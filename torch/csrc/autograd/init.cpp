@@ -450,20 +450,21 @@ PyObject* THPAutograd_initExtension(PyObject* _unused, PyObject* unused) {
       "_disable_profiler",
       disableProfiler,
       py::call_guard<py::gil_scoped_release>());
+  // Wrapped so that its warnings reach Python's warnings module.
   m.def(
       "_prepare_profiler",
-      [](const ProfilerConfig& config,
-         const std::set<ActivityType>& activities,
-         const ActivityFilter& activity_filter,
-         const ProfilerExtensionMap& profiler_extensions) {
-        prepareProfiler(
-            config, activities, activity_filter, profiler_extensions);
-      },
+      torch::wrap_pybind_function_no_gil(
+          [](const ProfilerConfig& config,
+             const std::set<ActivityType>& activities,
+             const ActivityFilter& activity_filter,
+             const ProfilerExtensionMap& profiler_extensions) {
+            prepareProfiler(
+                config, activities, activity_filter, profiler_extensions);
+          }),
       py::arg("config"),
       py::arg("activities"),
       py::arg("activity_filter") = ActivityFilter{},
-      py::arg("profiler_extensions") = ProfilerExtensionMap{},
-      py::call_guard<py::gil_scoped_release>());
+      py::arg("profiler_extensions") = ProfilerExtensionMap{});
   m.def(
       "_toggle_collection_dynamic",
       toggleCollectionDynamic,

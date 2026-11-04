@@ -8,9 +8,19 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from torch.profiler import (
+    KernelMetricsConfig,
+    PerformanceMetricsConfig,
+    ProfilerActivity,
+    ProfilerActivityConfig,
+)
 from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
     preserves_unittest_skip_marks,
     run_tests,
+    set_warn_always_context,
+    subtest,
     TEST_XPU,
     TestCase,
 )
@@ -19,6 +29,7 @@ from torch.testing._internal.common_utils import (
 Verbose = False
 
 
+@instantiate_parametrized_tests
 @preserves_unittest_skip_marks()
 class XpuScopeProfilerTest(TestCase):
     def __init__(self, arg):
@@ -67,7 +78,7 @@ class XpuScopeProfilerTest(TestCase):
         first_value = next(iter(rev_counter.values()))
         self.assertEqual(first_value, len(self.metrics_names))
 
-    def gen_and_check_json(self, p, json_file):
+    def gen_and_check_json(self, p, json_file, expect_default_activities=True):
         p.export_chrome_trace(json_file)
 
         with open(json_file) as f:
@@ -110,6 +121,9 @@ class XpuScopeProfilerTest(TestCase):
 
             self.assertTrue("xpu_runtime" in count_cats)
             self.assertTrue("kernel" in count_cats)
+            # Memory copies (here: the copy back to host) are a default XPU
+            # activity, dropped when the request lists metrics only.
+            self.assertEqual("gpu_memcpy" in count_cats, expect_default_activities)
 
             self.check_metrics(count_x_metrics)
             self.check_metrics(count_c_metrics)
@@ -141,38 +155,36 @@ class XpuScopeProfilerTest(TestCase):
             ]
         )
 
-    @unittest.skipIf(not TEST_XPU, "test requires XPU")
-    def test_scope_profiler(self):
+    def _skip_without_metrics_support(self):
         if not self.required_env_setting():
             self.skipTest("ZET_ENABLE_METRICS not set")
 
         if not self.required_paranoid_settings():
             self.skipTest("paranoid settings missing")
 
+    def _profile_workload(self, activities):
         a = torch.rand([100, 200]).to("xpu")
         b = torch.rand([200, 300]).to("xpu")
-        # Hardware metrics are requested through the fine-grained activity dict:
-        # {ProfilerActivity.XPU: [<metric names>]} enables the XPUPTI scope
-        # profiler and forwards the metric names to it.
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                {torch.profiler.ProfilerActivity.XPU: self.metrics_names},
-            ],
-        ) as p:
+        with torch.profiler.profile(activities=activities) as p:
             r1 = torch.matmul(a, b)
             r2 = torch.add(r1, 1.0)
             result = torch.abs(r2)
+            # Copy back to host, so the trace holds a device memcpy activity.
+            host_result = result.cpu()
 
-        self.assertTrue(result.numel() > 0)
+        self.assertTrue(host_result.numel() > 0)
+        return p
 
+    def _check_trace(self, p, expect_default_activities=True):
         json_file = os.environ.get("JSON_FILE")
 
         if json_file:
-            self.gen_and_check_json(p, json_file)
+            root, ext = os.path.splitext(json_file)
+            json_file = f"{root}_{self._testMethodName}{ext}"
+            self.gen_and_check_json(p, json_file, expect_default_activities)
         else:
             with tempfile.NamedTemporaryFile(mode="w+", delete=True) as tmp:
-                self.gen_and_check_json(p, tmp.name)
+                self.gen_and_check_json(p, tmp.name, expect_default_activities)
 
         if Verbose:
             print(p.key_averages().table())
@@ -181,6 +193,82 @@ class XpuScopeProfilerTest(TestCase):
             event.key.startswith("metrics: ") for event in p.key_averages()
         )
         self.assertTrue(count_metrics > 0)
+
+    @unittest.skipIf(not TEST_XPU, "test requires XPU")
+    def test_scope_profiler(self):
+        """Metrics from KernelMetricsConfig keep the default XPU activities."""
+        self._skip_without_metrics_support()
+
+        p = self._profile_workload(
+            [
+                ProfilerActivity.CPU,
+                {
+                    ProfilerActivity.XPU: ProfilerActivityConfig(
+                        profiler_configs=[
+                            KernelMetricsConfig(metric_names=self.metrics_names)
+                        ]
+                    )
+                },
+            ]
+        )
+        self._check_trace(p)
+
+    @unittest.skipIf(not TEST_XPU, "test requires XPU")
+    def test_scope_profiler_metric_names_in_activity_list(self):
+        """The deprecated form still collects metrics, but drops the defaults."""
+        self._skip_without_metrics_support()
+
+        with (
+            set_warn_always_context(True),
+            self.assertWarnsRegex(
+                UserWarning,
+                "is deprecated and will be removed.*drops the default XPU activities",
+            ),
+        ):
+            p = self._profile_workload(
+                [ProfilerActivity.CPU, {ProfilerActivity.XPU: self.metrics_names}]
+            )
+        self._check_trace(p, expect_default_activities=False)
+
+    def _profile_xpu_config(self, config):
+        with torch.profiler.profile(activities=[{ProfilerActivity.XPU: config}]):
+            pass
+
+    @unittest.skipIf(not TEST_XPU, "test requires XPU")
+    @parametrize(
+        "activity_types",
+        [
+            # The legacy form forwards a misspelled activity type as a metric
+            # name; with KernelMetricsConfig it is rejected.
+            subtest(["kernel"], name="misspelled_activity_type"),
+            subtest(["CONCURRENT_KERNEL", "GpuCoreClocks"], name="metric_name"),
+        ],
+    )
+    def test_activity_types_are_strict_with_metrics_config(self, activity_types):
+        """Metric names having their own field leaves no name to guess about."""
+        metrics = KernelMetricsConfig(metric_names=["GpuTime"])
+        with self.assertRaisesRegex(
+            RuntimeError, "belong in KernelMetricsConfig.metric_names"
+        ):
+            self._profile_xpu_config(
+                ProfilerActivityConfig(
+                    activity_types=activity_types, profiler_configs=[metrics]
+                )
+            )
+
+    @unittest.skipIf(not TEST_XPU, "test requires XPU")
+    def test_time_based_metrics_not_supported(self):
+        """XPU does not sample counters over time yet, so this must not pass quietly."""
+        with self.assertRaisesRegex(
+            RuntimeError, "not supported for ProfilerActivity.XPU"
+        ):
+            self._profile_xpu_config(
+                ProfilerActivityConfig(
+                    profiler_configs=[
+                        PerformanceMetricsConfig(metric_names=["GpuTime"])
+                    ]
+                )
+            )
 
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_activity_type_filter_does_not_enable_scope_profiler(self):

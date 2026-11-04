@@ -205,7 +205,9 @@ TORCH_API std::unique_ptr<ProfilerResult> disableProfiler();
 using ActivityFilter = std::unordered_map<
     torch::profiler::impl::ActivityType,
     std::unordered_set<std::string>>;
-using ProfilerExtensionMap = std::unordered_map<std::string, std::string>;
+using ProfilerExtensionMap = std::unordered_map<
+    torch::profiler::impl::ActivityType,
+    std::unordered_map<std::string, std::string>>;
 TORCH_API void prepareProfiler(
     const torch::profiler::impl::ProfilerConfig& config,
     const std::set<torch::profiler::impl::ActivityType>& activities,

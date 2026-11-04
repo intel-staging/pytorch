@@ -237,7 +237,7 @@ class profile:
         custom_trace_id_callback=None,
         post_processing_timeout_s: float | None = None,
         activity_filters: dict[ProfilerActivity, set[str]] | None = None,
-        _profiler_extensions: dict[str, str] | None = None,
+        _profiler_extensions: dict[ProfilerActivity, dict[str, str]] | None = None,
     ):
         if with_modules is not None:
             warn(_WITH_MODULES_DEPRECATION_MSG, FutureWarning, stacklevel=2)

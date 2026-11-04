@@ -112,7 +112,11 @@ using ActivitySet = std::set<torch::autograd::profiler::ActivityType>;
 using ActivityFilter = std::unordered_map<
     torch::autograd::profiler::ActivityType,
     std::unordered_set<std::string>>;
-using ProfilerExtensionMap = std::unordered_map<std::string, std::string>;
+// Per activity group, the extra profiler configuration of that group (see
+// ProfilerActivityConfig.profiler_configs).
+using ProfilerExtensionMap = std::unordered_map<
+    torch::autograd::profiler::ActivityType,
+    std::unordered_map<std::string, std::string>>;
 
 // The device activities Kineto can trace in this process, not counting CPU.
 // Empty without Kineto. For XPU this only says that PyTorch was built with XPU

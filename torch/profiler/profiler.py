@@ -44,6 +44,7 @@ __all__ = [
     "profile",
     "CuspyConfig",
     "ExecutionTraceObserver",
+    "KernelMetricsConfig",
     "PerformanceMetricsConfig",
     "ProfilerActivityConfig",
 ]
@@ -180,6 +181,9 @@ class PerformanceMetricsConfig(_ProfilerExtensionConfig):
             sampling interval. Defaults to 10 seconds.
 
     CUDA PM sampling uses the current CUDA device.
+
+    XPU does not sample hardware counters over time yet; use
+    :class:`KernelMetricsConfig` for per-kernel hardware metrics there.
     """
 
     metric_names: list[str]
@@ -199,6 +203,63 @@ class PerformanceMetricsConfig(_ProfilerExtensionConfig):
         return config
 
 
+@dataclass(kw_only=True)
+class KernelMetricsConfig(_ProfilerExtensionConfig):
+    """Configure hardware performance-counter metrics collected per kernel.
+
+    Unlike :class:`PerformanceMetricsConfig`, which samples counters over time,
+    this attributes the counter values to each kernel. Supported for
+    ``ProfilerActivity.XPU``, where the XPUPTI scope profiler collects them.
+
+    The values are attached to each kernel as counters, next to whatever
+    ``ProfilerActivityConfig.activity_types`` selects: leaving it unset collects
+    the group's default activities, and every name in it must be an activity
+    type. Kernels are collected even if it leaves out ``CONCURRENT_KERNEL``.
+    Attaching this config to any other group raises when the profiler starts. Collection requires
+    ``ZET_ENABLE_METRICS=1`` and access to the GPU performance counters
+    (``perf_stream_paranoid``/``observation_paranoid`` set to ``0``).
+
+    Args:
+        metric_names (list[str]): Backend-specific hardware metric names to collect.
+
+    Example::
+
+        with torch.profiler.profile(
+            activities=[
+                ProfilerActivity.CPU,
+                {
+                    ProfilerActivity.XPU: ProfilerActivityConfig(
+                        profiler_configs=[
+                            KernelMetricsConfig(metric_names=["GpuTime", "XVE_ACTIVE"])
+                        ]
+                    )
+                },
+            ]
+        ) as prof:
+            ...
+    """
+
+    metric_names: list[str]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.metric_names, str) or not all(
+            isinstance(name, str) for name in self.metric_names
+        ):
+            raise TypeError("KernelMetricsConfig.metric_names must be a list of str")
+        if not self.metric_names:
+            raise ValueError("KernelMetricsConfig lists no metric name")
+        for name in self.metric_names:
+            if not name or "," in name or any(c.isspace() for c in name):
+                raise ValueError(
+                    f"KernelMetricsConfig has an invalid metric name: {name!r}"
+                )
+        if len(set(self.metric_names)) != len(self.metric_names):
+            raise ValueError("KernelMetricsConfig lists a metric name twice")
+
+    def _to_config_entries(self) -> dict[str, str]:
+        return {"KERNEL_METRICS": ",".join(self.metric_names)}
+
+
 @dataclass
 class ProfilerActivityConfig:
     """Configure collection for an activity group.
@@ -206,14 +267,28 @@ class ProfilerActivityConfig:
     Args:
         activity_types (list[str], optional): Fine-grained activity types to
             collect. ``None`` collects the group's default activity types,
-            while an empty list collects none.
+            while an empty list collects none (a :class:`KernelMetricsConfig`
+            still collects kernels).
         profiler_configs (list): Additional profiler configurations associated
-            with this activity group, such as :class:`PerformanceMetricsConfig`
-            and :class:`CuspyConfig`.
+            with this activity group, such as :class:`PerformanceMetricsConfig`,
+            :class:`KernelMetricsConfig` and :class:`CuspyConfig`.
     """
 
     activity_types: list[str] | None = None
     profiler_configs: list[_ProfilerExtensionConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if (
+            sum(
+                isinstance(config, KernelMetricsConfig)
+                for config in self.profiler_configs
+            )
+            > 1
+        ):
+            raise ValueError(
+                "ProfilerActivityConfig lists KernelMetricsConfig more than once; "
+                "put all metric names into one"
+            )
 
     def _get_profiler_config(
         self, config_type: type[_ProfilerConfigT]
@@ -493,27 +568,29 @@ class _KinetoProfile:
         if (self.profiler is None) or (not self.acc_events):
             use_device = None if self._use_cuspy else self.use_device
             activity_filters = {}
-            profiler_configs = []
+            profiler_extensions = {}
             for activity, config in self.activity_configs.items():
                 if config.activity_types is not None:
                     activity_filters[activity] = set(config.activity_types)
-                profiler_configs.extend(config.profiler_configs)
-            if self._use_cuspy:
-                profiler_configs = [
-                    config
-                    for config in profiler_configs
-                    if not isinstance(config, PerformanceMetricsConfig)
-                ]
-            profiler_extensions = _get_profiler_extensions(profiler_configs)
-            if (
-                "PERFORMANCE_METRICS" in profiler_extensions
-                and torch.accelerator.current_accelerator() is not None
-            ):
-                # Metrics are collected on the accelerator in use; resolving the
-                # device through torch.cuda fails on every other backend.
-                profiler_extensions["PERFORMANCE_METRICS_DEVICE_ID"] = str(
-                    torch.accelerator.current_device_index()
-                )
+                profiler_configs = config.profiler_configs
+                if self._use_cuspy:
+                    profiler_configs = [
+                        profiler_config
+                        for profiler_config in profiler_configs
+                        if not isinstance(profiler_config, PerformanceMetricsConfig)
+                    ]
+                extensions = _get_profiler_extensions(profiler_configs)
+                if (
+                    "PERFORMANCE_METRICS" in extensions
+                    and torch.accelerator.current_accelerator() is not None
+                ):
+                    # Metrics are collected on the accelerator in use; resolving
+                    # the device through torch.cuda fails on every other backend.
+                    extensions["PERFORMANCE_METRICS_DEVICE_ID"] = str(
+                        torch.accelerator.current_device_index()
+                    )
+                if extensions:
+                    profiler_extensions[activity] = extensions
             self.profiler = prof.profile(
                 use_cpu=(ProfilerActivity.CPU in self.activities),
                 use_device=use_device,

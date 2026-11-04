@@ -42,6 +42,7 @@ from torch.profiler import (
     _utils,
     CuspyConfig,
     DeviceType,
+    KernelMetricsConfig,
     kineto_available,
     PerformanceMetricsConfig,
     profile,
@@ -2300,8 +2301,8 @@ torch.ones(10) * 2
             p.prepare_trace()
         self.assertEqual(
             kineto_profile.call_args.kwargs["_profiler_extensions"][
-                "PERFORMANCE_METRICS_DEVICE_ID"
-            ],
+                ProfilerActivity.CUDA
+            ]["PERFORMANCE_METRICS_DEVICE_ID"],
             "3",
         )
 
@@ -2333,7 +2334,12 @@ torch.ones(10) * 2
             p.prepare_trace()
         self.assertEqual(
             kineto_profile.call_args.kwargs["_profiler_extensions"],
-            {"PERFORMANCE_METRICS": "metric_a", "PERFORMANCE_METRICS_DEVICE_ID": "2"},
+            {
+                ProfilerActivity.XPU: {
+                    "PERFORMANCE_METRICS": "metric_a",
+                    "PERFORMANCE_METRICS_DEVICE_ID": "2",
+                }
+            },
         )
 
     def test_performance_metrics_without_accelerator(self):
@@ -2346,8 +2352,56 @@ torch.ones(10) * 2
             p.prepare_trace()
         self.assertEqual(
             kineto_profile.call_args.kwargs["_profiler_extensions"],
-            {"PERFORMANCE_METRICS": "metric_a"},
+            {ProfilerActivity.CUDA: {"PERFORMANCE_METRICS": "metric_a"}},
         )
+
+    def test_kernel_metrics_config_validates_metric_names(self):
+        """Names are joined with commas on their way to the backend, so a bad
+        one would be silently reshaped there."""
+        for metric_names, error, message in [
+            ([], ValueError, "lists no metric name"),
+            ("GpuTime", TypeError, "must be a list of str"),
+            (["GpuTime,XVE_ACTIVE"], ValueError, "invalid metric name"),
+            ([""], ValueError, "invalid metric name"),
+            ([" GpuTime"], ValueError, "invalid metric name"),
+            (["Gpu\nTime"], ValueError, "invalid metric name"),
+            (["GpuTime", "GpuTime"], ValueError, "lists a metric name twice"),
+        ]:
+            with self.subTest(metric_names=metric_names):
+                with self.assertRaisesRegex(error, message):
+                    KernelMetricsConfig(metric_names=metric_names)
+
+    def test_kernel_metrics_config_listed_once_per_group(self):
+        """A second config in the same group would silently replace the first."""
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            ProfilerActivityConfig(
+                profiler_configs=[
+                    KernelMetricsConfig(metric_names=["metric_a"]),
+                    KernelMetricsConfig(metric_names=["metric_b"]),
+                ]
+            )
+
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    def test_kernel_metrics_config_needs_xpu(self):
+        """Only the XPU group collects hardware metrics per kernel."""
+        metrics = KernelMetricsConfig(metric_names=["metric_a", "metric_b"])
+        self.assertEqual(
+            _get_profiler_extensions([metrics]),
+            {"KERNEL_METRICS": "metric_a,metric_b"},
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "only supported for ProfilerActivity.XPU"
+        ):
+            with profile(
+                activities=[
+                    {
+                        ProfilerActivity.CPU: ProfilerActivityConfig(
+                            profiler_configs=[metrics]
+                        )
+                    }
+                ]
+            ):
+                pass
 
     def test_cuspy_config_routes_performance_metrics(self):
         performance_metrics = PerformanceMetricsConfig(

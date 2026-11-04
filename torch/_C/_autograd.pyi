@@ -117,7 +117,7 @@ def _prepare_profiler(
     config: ProfilerConfig,
     activities: set[ProfilerActivity],
     activity_filter: dict[ProfilerActivity, set[str]] = ...,
-    profiler_extensions: dict[str, str] = ...,
+    profiler_extensions: dict[ProfilerActivity, dict[str, str]] = ...,
 ) -> None: ...
 def _toggle_collection_dynamic(
     enable: bool,
