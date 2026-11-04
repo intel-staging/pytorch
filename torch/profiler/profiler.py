@@ -505,9 +505,14 @@ class _KinetoProfile:
                     if not isinstance(config, PerformanceMetricsConfig)
                 ]
             profiler_extensions = _get_profiler_extensions(profiler_configs)
-            if "PERFORMANCE_METRICS" in profiler_extensions:
+            if (
+                "PERFORMANCE_METRICS" in profiler_extensions
+                and torch.accelerator.current_accelerator() is not None
+            ):
+                # Metrics are collected on the accelerator in use; resolving the
+                # device through torch.cuda fails on every other backend.
                 profiler_extensions["PERFORMANCE_METRICS_DEVICE_ID"] = str(
-                    torch.cuda.current_device()
+                    torch.accelerator.current_device_index()
                 )
             self.profiler = prof.profile(
                 use_cpu=(ProfilerActivity.CPU in self.activities),

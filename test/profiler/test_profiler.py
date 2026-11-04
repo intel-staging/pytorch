@@ -2290,7 +2290,11 @@ torch.ones(10) * 2
             {"PERFORMANCE_METRICS": ""},
         )
         with (
-            patch("torch.cuda.current_device", return_value=3),
+            patch(
+                "torch.accelerator.current_accelerator",
+                return_value=torch.device("cuda"),
+            ),
+            patch("torch.accelerator.current_device_index", return_value=3),
             patch("torch.profiler.profiler.prof.profile") as kineto_profile,
         ):
             p.prepare_trace()
@@ -2299,6 +2303,50 @@ torch.ones(10) * 2
                 "PERFORMANCE_METRICS_DEVICE_ID"
             ],
             "3",
+        )
+
+    def _profile_with_metrics(self, activity):
+        return profile(
+            activities=[
+                {
+                    activity: ProfilerActivityConfig(
+                        profiler_configs=[
+                            PerformanceMetricsConfig(metric_names=["metric_a"])
+                        ]
+                    )
+                }
+            ]
+        )
+
+    def test_performance_metrics_device_from_accelerator(self):
+        """The metrics device is the current accelerator, not whatever CUDA says."""
+        p = self._profile_with_metrics(ProfilerActivity.XPU)
+        with (
+            patch("torch.cuda.current_device", side_effect=AssertionError("no CUDA")),
+            patch(
+                "torch.accelerator.current_accelerator",
+                return_value=torch.device("xpu"),
+            ),
+            patch("torch.accelerator.current_device_index", return_value=2),
+            patch("torch.profiler.profiler.prof.profile") as kineto_profile,
+        ):
+            p.prepare_trace()
+        self.assertEqual(
+            kineto_profile.call_args.kwargs["_profiler_extensions"],
+            {"PERFORMANCE_METRICS": "metric_a", "PERFORMANCE_METRICS_DEVICE_ID": "2"},
+        )
+
+    def test_performance_metrics_without_accelerator(self):
+        """With no accelerator to read, the device choice is left to the profiler."""
+        p = self._profile_with_metrics(ProfilerActivity.CUDA)
+        with (
+            patch("torch.accelerator.current_accelerator", return_value=None),
+            patch("torch.profiler.profiler.prof.profile") as kineto_profile,
+        ):
+            p.prepare_trace()
+        self.assertEqual(
+            kineto_profile.call_args.kwargs["_profiler_extensions"],
+            {"PERFORMANCE_METRICS": "metric_a"},
         )
 
     def test_cuspy_config_routes_performance_metrics(self):
