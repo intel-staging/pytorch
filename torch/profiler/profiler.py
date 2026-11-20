@@ -303,6 +303,25 @@ class ProfilerActivityConfig:
         )
 
 
+def _current_device_index(activity: ProfilerActivity) -> int | None:
+    """Return the current device of the backend that ``activity`` profiles.
+
+    A CPU group has no device of its own and takes the available accelerator's.
+    """
+    if activity == ProfilerActivity.CPU:
+        if torch.accelerator.current_accelerator(check_available=True) is None:
+            return None
+        return torch.accelerator.current_device_index()
+    device_types = {
+        ProfilerActivity.CUDA: "cuda",
+        ProfilerActivity.XPU: "xpu",
+        ProfilerActivity.MTIA: "mtia",
+        ProfilerActivity.HPU: "hpu",
+        ProfilerActivity.PrivateUse1: _get_privateuse1_backend_name(),
+    }
+    return torch.get_device_module(device_types[activity]).current_device()
+
+
 def _get_profiler_extensions(
     profiler_configs: Iterable[_ProfilerExtensionConfig],
 ) -> dict[str, str]:
@@ -580,15 +599,10 @@ class _KinetoProfile:
                         if not isinstance(profiler_config, PerformanceMetricsConfig)
                     ]
                 extensions = _get_profiler_extensions(profiler_configs)
-                if (
-                    "PERFORMANCE_METRICS" in extensions
-                    and torch.accelerator.current_accelerator() is not None
-                ):
-                    # Metrics are collected on the accelerator in use; resolving
-                    # the device through torch.cuda fails on every other backend.
-                    extensions["PERFORMANCE_METRICS_DEVICE_ID"] = str(
-                        torch.accelerator.current_device_index()
-                    )
+                if "PERFORMANCE_METRICS" in extensions:
+                    device_index = _current_device_index(activity)
+                    if device_index is not None:
+                        extensions["PERFORMANCE_METRICS_DEVICE_ID"] = str(device_index)
                 if extensions:
                     profiler_extensions[activity] = extensions
             self.profiler = prof.profile(

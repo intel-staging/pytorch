@@ -2290,12 +2290,10 @@ torch.ones(10) * 2
             ),
             {"PERFORMANCE_METRICS": ""},
         )
+        cuda = MagicMock()
+        cuda.current_device.return_value = 3
         with (
-            patch(
-                "torch.accelerator.current_accelerator",
-                return_value=torch.device("cuda"),
-            ),
-            patch("torch.accelerator.current_device_index", return_value=3),
+            patch("torch.get_device_module", return_value=cuda),
             patch("torch.profiler.profiler.prof.profile") as kineto_profile,
         ):
             p.prepare_trace()
@@ -2319,41 +2317,66 @@ torch.ones(10) * 2
             ]
         )
 
-    def test_performance_metrics_device_from_accelerator(self):
-        """The metrics device is the current accelerator, not whatever CUDA says."""
-        p = self._profile_with_metrics(ProfilerActivity.XPU)
-        with (
-            patch("torch.cuda.current_device", side_effect=AssertionError("no CUDA")),
-            patch(
-                "torch.accelerator.current_accelerator",
-                return_value=torch.device("xpu"),
-            ),
-            patch("torch.accelerator.current_device_index", return_value=2),
-            patch("torch.profiler.profiler.prof.profile") as kineto_profile,
-        ):
-            p.prepare_trace()
-        self.assertEqual(
-            kineto_profile.call_args.kwargs["_profiler_extensions"],
-            {
-                ProfilerActivity.XPU: {
-                    "PERFORMANCE_METRICS": "metric_a",
-                    "PERFORMANCE_METRICS_DEVICE_ID": "2",
-                }
-            },
-        )
+    def test_performance_metrics_device_from_group(self):
+        """The metrics device is the current device of the group's backend,
+        whatever accelerator torch.accelerator reports."""
+        for activity, device_type in [
+            (ProfilerActivity.CUDA, "cuda"),
+            (ProfilerActivity.MTIA, "mtia"),
+        ]:
+            with self.subTest(activity=activity):
+                p = self._profile_with_metrics(activity)
+                device_module = MagicMock()
+                device_module.current_device.return_value = 2
+                with (
+                    patch(
+                        "torch.get_device_module", return_value=device_module
+                    ) as get_device_module,
+                    patch(
+                        "torch.accelerator.current_device_index",
+                        side_effect=AssertionError("not the group's device"),
+                    ),
+                    patch("torch.profiler.profiler.prof.profile") as kineto_profile,
+                ):
+                    p.prepare_trace()
+                get_device_module.assert_called_once_with(device_type)
+                self.assertEqual(
+                    kineto_profile.call_args.kwargs["_profiler_extensions"],
+                    {
+                        activity: {
+                            "PERFORMANCE_METRICS": "metric_a",
+                            "PERFORMANCE_METRICS_DEVICE_ID": "2",
+                        }
+                    },
+                )
 
-    def test_performance_metrics_without_accelerator(self):
-        """With no accelerator to read, the device choice is left to the profiler."""
-        p = self._profile_with_metrics(ProfilerActivity.CUDA)
-        with (
-            patch("torch.accelerator.current_accelerator", return_value=None),
-            patch("torch.profiler.profiler.prof.profile") as kineto_profile,
-        ):
-            p.prepare_trace()
-        self.assertEqual(
-            kineto_profile.call_args.kwargs["_profiler_extensions"],
-            {ProfilerActivity.CUDA: {"PERFORMANCE_METRICS": "metric_a"}},
-        )
+    def test_performance_metrics_device_for_cpu_group(self):
+        """A CPU group takes the available accelerator's device, if any."""
+        for accelerator, expected in [
+            (torch.device("xpu"), {"PERFORMANCE_METRICS_DEVICE_ID": "3"}),
+            # No device id is passed, so nothing is sampled.
+            (None, {}),
+        ]:
+            with self.subTest(accelerator=accelerator):
+                p = self._profile_with_metrics(ProfilerActivity.CPU)
+                with (
+                    patch(
+                        "torch.accelerator.current_accelerator",
+                        return_value=accelerator,
+                    ),
+                    patch("torch.accelerator.current_device_index", return_value=3),
+                    patch("torch.profiler.profiler.prof.profile") as kineto_profile,
+                ):
+                    p.prepare_trace()
+                self.assertEqual(
+                    kineto_profile.call_args.kwargs["_profiler_extensions"],
+                    {
+                        ProfilerActivity.CPU: {
+                            "PERFORMANCE_METRICS": "metric_a",
+                            **expected,
+                        }
+                    },
+                )
 
     def test_kernel_metrics_config_validates_metric_names(self):
         """Names are joined with commas on their way to the backend, so a bad
